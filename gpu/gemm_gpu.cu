@@ -1,5 +1,6 @@
 #include "../include/utils.h"
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #define NUM_RUNS 10
 
@@ -103,18 +104,46 @@ void gemm_gpu_o0(float* A, float* B, float* C, int M, int N, int K)
 }
 
 // The scafolding for optimized GEMM implementations
-__global__ void gemm_gpu_o1_kernel(float* A, float* B, float *C, int M, int N, int K) {
+__global__ void gemm_gpu_o1_kernel(float* A, float* B, float *C, int M, int N, int K)
+{
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < M; i+= stride){
+		for (int j = 0; j < N; j++) {
+			for (int k = 0; k < K; k++) {
+				C[i * N + j]  += A[i * K + k]  * B[k * N + j];
+			}
+		}
+	}
 }
 void gemm_gpu_o1(float* A, float* B, float* C, int M, int N, int K)
 {
 	// Init block and grid size
+	dim3 blockSize(128);
+	dim3 gridSize((M + blockSize.x - 1) / blockSize.x, 1);
+	gemm_gpu_o1_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
-__global__ void gemm_gpu_o2_kernel(float* A, float* B, float *C, int M, int N, int K) {
+__global__ void gemm_gpu_o2_kernel(float* A, float* B, float *C, int M, int N, int K)
+{
+	int indexj = blockIdx.x * blockDim.x + threadIdx.x;
+	int stridej = blockDim.x * gridDim.x;
+	int indexi = blockIdx.y * blockDim.y + threadIdx.y;
+	int stridei = blockDim.y * gridDim.y;
+	for (int i = indexi; i < M; i+= stridei){
+		for (int j = indexj; j < N; j+= stridej) {
+			for (int k = 0; k < K; k++) {
+				C[i * N + j]  += A[i * K + k]  * B[k * N + j];
+			}
+		}
+	}
 }
 void gemm_gpu_o2(float* A, float* B, float* C, int M, int N, int K)
 {
 	// Init block and grid size
+	dim3 blockSize(16,16);
+	dim3 gridSize((M + blockSize.x - 1) / blockSize.x, (N + blockSize.y - 1) / blockSize.y, 1);
+	gemm_gpu_o2_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
 __global__ void gemm_gpu_o3_kernel(float* A, float* B, float *C, int M, int N, int K) {
@@ -122,8 +151,38 @@ __global__ void gemm_gpu_o3_kernel(float* A, float* B, float *C, int M, int N, i
 void gemm_gpu_o3(float* A, float* B, float* C, int M, int N, int K)
 {
 	// Init block and grid size
+	dim3 blockSize(32,8);
+	dim3 gridSize((M + blockSize.x - 1) / blockSize.x, (N + blockSize.y - 1) / blockSize.y, 1);
+
+	//
+	gemm_gpu_o2_kernel<<<gridSize, blockSize>>>(A, B, C, M, N, K);
 }
 
+// https://modal.com/gpu-glossary/host-software/cublas
+// performs single-precision C = alpha * A @ B + beta * C
+// on row-major matrices using cublasSgemm
+static cublasHandle_t handle;
+void sgemm_row_major(const float *A, const float *B, float *C, 
+						int M, int N, int K) {
+
+  // A is M x K (row-major), cuBLAS sees it as A^T (K x M, column-major),
+  //   the leading dimension of A^T is K
+  // B is K x N (row-major), cuBLAS sees it as B^T (N x K, column-major),
+  //   the leading dimension of B^T is N
+  // C is M x N (row-major), cuBLAS sees it as C^T (N x M, column-major),
+  //   the leading dimension of C^T is N
+
+  const float alpha = 1.0f;
+  const float beta = 1.0f;
+  // note the swapped A and B, and the swapped M and N
+  cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+              N, M, K,
+              &alpha,
+              B, N,  // leading dimension of B^T
+              A, K,  // leading dimension of A^T
+              &beta,
+              C, N); // leading dimension of C^T
+}
 
 
 int main(int argc, char* argv[]) {
@@ -131,6 +190,8 @@ int main(int argc, char* argv[]) {
 		std::cout << "Usage: mp1 <M> <N> <K>" << std::endl;
 		return 1;
 	}
+
+	cublasCreate(&handle);
 
 	int M = atoi(argv[1]);
 	int N = atoi(argv[2]);
@@ -152,12 +213,14 @@ int main(int argc, char* argv[]) {
 	CHECK(gemm_gpu_o1)
 	CHECK(gemm_gpu_o2)
 	CHECK(gemm_gpu_o3)
+	CHECK(sgemm_row_major)
 
 	// Actual run
- 	TIME(gemm_gpu_o0)
-	TIME(gemm_gpu_o1)
-	TIME(gemm_gpu_o2)
+ 	//TIME(gemm_gpu_o0)
+	//TIME(gemm_gpu_o1)
+	//TIME(gemm_gpu_o2)
 	TIME(gemm_gpu_o3)
+	TIME(sgemm_row_major)
 
 	cudaFreeHost(A);
 	cudaFreeHost(B);
